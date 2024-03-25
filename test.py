@@ -28,6 +28,9 @@ from timm.utils import accuracy, AverageMeter, natural_key, setup_default_loggin
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
 from timm.models._manipulate import checkpoint_seq
 
+from torchvision.transforms import Resize
+import torch
+import torch.nn.functional as F
 
 try:
     from apex import amp
@@ -165,19 +168,23 @@ parser.add_argument('--retry', default=False, action='store_true',
 
 
 class ViTB16_32(nn.Module):
-    def __init__(self, base_model_name: str, img_size: int, patch_size: int, num_classes: int = 1000, pretrained: bool = False):
+    def __init__(self, base_model_name: str, img_size: int, patch_size: int, num_classes: int = 1000, pretrained: bool = False, interpolate: bool = False):
         super(ViTB16_32, self).__init__()
         # load the base model without any weights, just a place holder
-        self.base_model = timm.create_model(model_name=base_model_name, pretrained=False, num_classes=num_classes)
+        self.base_model = timm.create_model(model_name=base_model_name, pretrained=pretrained, num_classes=num_classes)
+
+        # saving the 16x16 patch + pos embedding for interpolation
+        self.orig_patch_embed = self.base_model.patch_embed
+        self.orig_pos_embed = self.base_model.pos_embed
 
         # get the total patches and then init the new patch embeds
-        self.num_patches = (img_size// patch_size) ** 2 # create a tuple (x,x)
+        self.num_patches = (img_size // patch_size) ** 2 # create a tuple (x,x)
         self.patch_size = patch_size
 
         embed_args = {} 
         # init the new patch embedding wieght
-        self.base_model.patch_embed = PatchEmbed( img_size=224,
-                                                 patch_size=32,
+        self.base_model.patch_embed = PatchEmbed( img_size=img_size,
+                                                 patch_size=patch_size,
                                                  in_chans=3,
                                                  embed_dim=768,
                                                  bias=not False,  # disable bias if pre-norm is used (e.g. CLIP)
@@ -194,6 +201,16 @@ class ViTB16_32(nn.Module):
         # init the pos embed and patch embed in he init
         nn.init.kaiming_uniform_(self.base_model.pos_embed)
 
+        if interpolate:
+            # interpolate the weights from 16x16 to 32x32
+            # resize the patch + pos embeddings
+            resized_patch_embed_weights = F.interpolate(self.orig_patch_embed.proj.weight, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+            resized_pos_embed = self.interpolate_pos_embed()
+
+            self.base_model.patch_embed.proj.weight = torch.nn.Parameter(resized_patch_embed_weights) # convert back to parameter
+            self.base_model.patch_embed.proj.bias = torch.nn.Parameter(self.orig_patch_embed.proj.bias.data)
+            self.base_model.pos_embed = torch.nn.Parameter(resized_pos_embed)
+
         if pretrained:
             self._init_pretrained_weights(base_model_name, num_classes)
 
@@ -209,6 +226,37 @@ class ViTB16_32(nn.Module):
 
         # Load the updated state dict
         self.base_model.load_state_dict(current_state_dict)
+
+    def interpolate_pos_embed(self):
+        """interpolate the position embedding with the new size
+
+        Args:
+            pos_embed (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        original_embedding_size = self.orig_pos_embed.shape[-1] # original patch embeds
+        new_num_patches = self.num_patches # new num patches / old was 196 ; new will be 49
+
+        new_num_extra_tokens = self.base_model.pos_embed.shape[-2] - new_num_patches # new num extra patches
+        
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((self.orig_pos_embed.shape[-2] - new_num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(new_num_patches ** 0.5)
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = self.orig_pos_embed[:, :new_num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = self.orig_pos_embed[:, new_num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, original_embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            return new_pos_embed
 
     def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
         if self.base_model.dynamic_img_size:
@@ -449,7 +497,7 @@ def validate(args):
 
 def main():
     # Initialize the model
-    patch_32_model = ViTB16_32(base_model_name='vit_base_patch16_224', img_size=224, patch_size=32, num_classes=1000, pretrained=True)
+    patch_32_model = ViTB16_32(base_model_name='vit_base_patch16_224', img_size=224, patch_size=32, num_classes=1000, pretrained=True, interpolate=True)
 
     setup_default_logging()
     args = parser.parse_args()
