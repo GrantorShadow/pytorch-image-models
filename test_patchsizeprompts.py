@@ -1,6 +1,7 @@
 import timm
 import torch
 import torch.nn as nn
+import train_patchsizeprompts
 
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
@@ -32,7 +33,24 @@ from torchvision.transforms import Resize
 import torch
 import torch.nn.functional as F
 
-try:
+from timm.models.vision_transformer import VisionTransformer
+from timm.models.vision_transformer_VPT import vision_transformer_vpt_base_patch16_224
+from timm.models.vision_transformer_VPT import VisionTransformerVPT
+
+import timm
+
+from typing import Callable, Dict, Optional, Sequence, Set, Tuple, Type, Union, List
+
+from timm.models.vision_transformer import VisionTransformer, PatchEmbed, LayerType
+
+from timm.models._registry import generate_default_cfgs, register_model, register_model_deprecations
+
+from timm.models._builder import build_model_with_cfg
+
+from copy import copy
+
+
+try: 
     from apex import amp
     has_apex = True
 except ImportError:
@@ -165,13 +183,55 @@ parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
 
 
+class VitB16_32(nn.Module):
+    def __init__(self, base_model_name: str, img_size: int, patch_size: int, num_classes: int = 1000, pretrained: bool = False, interpolate: bool = False, vpt: bool = True):
+        """Visual Prompt Tuning based on ViT-B/16 Transformer
 
+        Args:
+            base_model_name (str): _description_
+            img_size (int): _description_
+            patch_size (int): _description_
+            num_classes (int, optional): _description_. Defaults to 1000.
+            pretrained (bool, optional): _description_. Defaults to False.
+            interpolate (bool, optional): _description_. Defaults to False.
+            vpt (bool, optional): _description_. Defaults to True.
+        """
+        super(VitB16_32, self).__init__()
 
-class ViTB16_32(nn.Module):
-    def __init__(self, base_model_name: str, img_size: int, patch_size: int, num_classes: int = 1000, pretrained: bool = False, interpolate: bool = False):
-        super(ViTB16_32, self).__init__()
-        # load the base model without any weights, just a place holder
-        self.base_model = timm.create_model(model_name=base_model_name, pretrained=pretrained, num_classes=num_classes)
+        if vpt:
+            base_vit_vpt = VisionTransformerVPT(base_model_name = base_model_name,
+                                                pretrained = pretrained,
+                                                VPT_Project_dim = -1,
+                                                VPT_Prompt_Token_Num = 10,
+                                                VPT_type = "Shallow",
+                                                VPT_Deep_Shared = "False",
+                                                VPT_Dropout = 0.1,
+                                                VPT_Initiation = 'random',
+                                                VPT_Location = 'prepend',
+                                                VPT_Num_Deep_Layers = None,
+                                                VPT_Reverse_Deep = False,
+                                                VPT_VIT_Pool_Type = 'original',
+                                                VPT_Forward_Deep_Noexpand = 'False',
+                                                num_classes=1000, # or however many you need
+                                                embed_dim=768, # Embedding dimension
+                                                depth=12,  # Depth, number of transformer blocks
+                                                num_heads=12, # Number of attention heads
+                                                img_size=224, # Input image size
+                                                patch_size=16,
+                                                in_chans=3,  # Number of input channels (for RGB images this is 3)
+                                                mlp_ratio=4.,  # MLP ratio
+                                                qkv_bias=True,  # Include bias for QKV if True
+                                            ) # Size of the patche
+            
+            # base_vit_vpt = vision_transformer_vpt_base_patch16_224(pretrained = True, img_size=224, patch_size=16,
+            #                                                         num_classes = 1000, VPT_Prompt_Token_Num=1,
+            #                                                         base_model_name="vit_base_patch16_224.augreg2_in21k_ft_in1k")
+            self.base_model = base_vit_vpt
+        else:
+            # load the base model without any weights, just a place holder
+            base_vit = timm.create_model(model_name=base_model_name, pretrained=pretrained, num_classes=num_classes)
+            
+            self.base_model = base_vit
 
         # saving the 16x16 patch + pos embedding for interpolation
         self.orig_patch_embed = self.base_model.patch_embed
@@ -211,7 +271,9 @@ class ViTB16_32(nn.Module):
             self.base_model.patch_embed.proj.bias = torch.nn.Parameter(self.orig_patch_embed.proj.bias.data)
             self.base_model.pos_embed = torch.nn.Parameter(resized_pos_embed)
 
-        if pretrained:
+        # only for validation without VPT addition
+        if vpt is False and pretrained is True:
+            assert isinstance(self.base_model, VisionTransformer)
             self._init_pretrained_weights(base_model_name, num_classes)
 
     def _init_pretrained_weights(self, base_model_name: str, num_classes: int):
@@ -229,6 +291,7 @@ class ViTB16_32(nn.Module):
 
     def interpolate_pos_embed(self):
         """interpolate the position embedding with the new size
+        taken from https://github.com/mlfoundations/open_clip/blob/73fa7f03a33da53653f61841eb6d69aef161e521/src/open_clip/pos_embed.py#L75
 
         Args:
             pos_embed (_type_): _description_
@@ -306,6 +369,16 @@ class ViTB16_32(nn.Module):
             x = self.base_model.blocks(x)
         x = self.base_model.norm(x)
         return x
+    
+    def forward_features_prompts(self, x):
+        # Apply parent class's patch embedding process
+        embeddings = self.forward_features(x)
+
+        # Process and prepend VPT embeddings
+        x = self.base_model._incorporate_prompt(embeddings)
+
+        return x
+
 
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
         if self.base_model.attn_pool is not None:
@@ -319,11 +392,16 @@ class ViTB16_32(nn.Module):
         return x if pre_logits else self.base_model.head(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.forward_features(x)
+        self.base_model._freeze_all_parameters()
+        self.base_model._unfreeze_vpt_parameters()
+
+        x = self.forward_features_prompts(x) # encapsulates forward features
         x = self.forward_head(x)
         return x
 
-
+def train(args):
+    pass
+    #TODO get the train loop from the train file
     
 def validate(args):
     # might as well try to validate something
@@ -345,6 +423,9 @@ def validate(args):
     #     args.num_classes = model.num_classes
 
     model = args.model_eval
+
+    if args.checkpoint:
+        load_checkpoint(model, args.checkpoint, args.use_ema)
 
     param_count = sum([m.numel() for m in model.parameters()])
     _logger.info('Model %s created, param count: %d' % (args.model, param_count))
@@ -496,21 +577,32 @@ def validate(args):
 
 
 def main():
+    train = False
     # Initialize the model
-    patch_32_model = ViTB16_32(base_model_name='vit_base_patch16_224', img_size=224, patch_size=32, num_classes=1000, pretrained=True, interpolate=True)
+    patch_32_model = VitB16_32(base_model_name='vit_base_patch16_224',
+                               img_size=224,
+                               patch_size=32,
+                               num_classes=1000,
+                               pretrained=True,
+                               interpolate=True,
+                               vpt=True)
 
     setup_default_logging()
     args = parser.parse_args()
     
-    args.model_eval = patch_32_model
+    args.model_eval = patch_32_model.base_model
+    
 
-    results = validate(args)
+    if train is True:
+        train_patchsizeprompts.train(patch_32_model)
+    else:
+        results = validate(args)
 
-    if args.results_file:
-        write_results(args.results_file, results, format=args.results_format)
+        if args.results_file:
+            write_results(args.results_file, results, format=args.results_format)
 
-    # output results in JSON to stdout w/ delimiter for runner script
-    print(f'--result\n{json.dumps(results, indent=4)}')
+        # output results in JSON to stdout w/ delimiter for runner script
+        print(f'--result\n{json.dumps(results, indent=4)}')
 
 
 def write_results(results_file, results, format='csv'):
