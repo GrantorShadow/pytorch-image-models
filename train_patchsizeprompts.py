@@ -648,7 +648,7 @@ class VitB16_32(nn.Module):
 
 def main():
     # Initialize the model
-    patch_32_model = VitB16_32(base_model_name='vit_base_patch16_224',
+    patch_32_model = VitB16_32(base_model_name='vit_base_patch16_clip_224.openai_ft_in12k_in1k',
                                img_size=224,
                                patch_size=32,
                                num_classes=1000,

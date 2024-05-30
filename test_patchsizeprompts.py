@@ -233,33 +233,34 @@ class VitB16_32(nn.Module):
             
             self.base_model = base_vit
 
-        # saving the 16x16 patch + pos embedding for interpolation
-        self.orig_patch_embed = self.base_model.patch_embed
-        self.orig_pos_embed = self.base_model.pos_embed
+        if patch_size != 16:
+            # saving the 16x16 patch + pos embedding for interpolation
+            self.orig_patch_embed = self.base_model.patch_embed
+            self.orig_pos_embed = self.base_model.pos_embed
 
-        # get the total patches and then init the new patch embeds
-        self.num_patches = (img_size // patch_size) ** 2 # create a tuple (x,x)
-        self.patch_size = patch_size
+            # get the total patches and then init the new patch embeds
+            self.num_patches = (img_size // patch_size) ** 2 # create a tuple (x,x)
+            self.patch_size = patch_size
 
-        embed_args = {} 
-        # init the new patch embedding wieght
-        self.base_model.patch_embed = PatchEmbed( img_size=img_size,
-                                                 patch_size=patch_size,
-                                                 in_chans=3,
-                                                 embed_dim=768,
-                                                 bias=not False,  # disable bias if pre-norm is used (e.g. CLIP)
-                                                 dynamic_img_pad=False,
-                                                 **embed_args)
+            embed_args = {} 
+            # init the new patch embedding wieght
+            self.base_model.patch_embed = PatchEmbed( img_size=img_size,
+                                                    patch_size=patch_size,
+                                                    in_chans=3,
+                                                    embed_dim=768,
+                                                    bias=not False,  # disable bias if pre-norm is used (e.g. CLIP)
+                                                    dynamic_img_pad=False,
+                                                    **embed_args)
 
-        # now get the new pos embed
-        # pos_embed_shape = (1, self.num_patches + 1, self.base_model.embed_dim)
-        #nn.Parameter(torch.randn(pos_embed_shape))
+            # now get the new pos embed
+            # pos_embed_shape = (1, self.num_patches + 1, self.base_model.embed_dim)
+            #nn.Parameter(torch.randn(pos_embed_shape))
 
-        embed_len = self.num_patches if self.base_model.no_embed_class else self.num_patches + self.base_model.num_prefix_tokens
-        self.base_model.pos_embed = nn.Parameter(torch.randn(1, embed_len, self.base_model.embed_dim) * .02)
+            embed_len = self.num_patches if self.base_model.no_embed_class else self.num_patches + self.base_model.num_prefix_tokens
+            self.base_model.pos_embed = nn.Parameter(torch.randn(1, embed_len, self.base_model.embed_dim) * .02)
 
-        # init the pos embed and patch embed in he init
-        nn.init.kaiming_uniform_(self.base_model.pos_embed)
+            # init the pos embed and patch embed in he init
+            nn.init.kaiming_uniform_(self.base_model.pos_embed)
 
         if interpolate:
             # interpolate the weights from 16x16 to 32x32
@@ -268,10 +269,11 @@ class VitB16_32(nn.Module):
             resized_pos_embed = self.interpolate_pos_embed()
 
             self.base_model.patch_embed.proj.weight = torch.nn.Parameter(resized_patch_embed_weights) # convert back to parameter
-            self.base_model.patch_embed.proj.bias = torch.nn.Parameter(self.orig_patch_embed.proj.bias.data)
+            if self.orig_patch_embed.proj.bias:
+                self.base_model.patch_embed.proj.bias = torch.nn.Parameter(self.orig_patch_embed.proj.bias.data)
             self.base_model.pos_embed = torch.nn.Parameter(resized_pos_embed)
 
-        # only for validation without VPT addition
+        # only for validation without VPT addition but changed patch size
         if vpt is False and pretrained is True:
             assert isinstance(self.base_model, VisionTransformer)
             self._init_pretrained_weights(base_model_name, num_classes)
@@ -578,8 +580,8 @@ def validate(args):
 
 def main():
     train = False
-    # Initialize the model
-    patch_32_model = VitB16_32(base_model_name='vit_base_patch16_224',
+    # Initialize the model vit_base_patch16_224 vit_base_patch16_clip_224.laion2b_ft_in12k_in1k
+    patch_32_model = VitB16_32(base_model_name='vit_base_patch16_clip_224.openai_ft_in12k_in1k',
                                img_size=224,
                                patch_size=32,
                                num_classes=1000,
